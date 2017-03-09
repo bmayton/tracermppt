@@ -1,35 +1,123 @@
 import serial
 import struct
+import logging
+import socket
 from enum import Enum
 
 class Commands(Enum):
     ReadRealtime = 0xA0
     ManualControl = 0xAA
 
-class Tracer:
+class BufferedSocketReceiver:
+    
+    def __init__(self, address):
+        self.address = address
+        self.sock = None
+        self.log = logging.getLogger('tracer.socket')
+        self.buffer = ""
+
+    def connect(self):
+        self.log.info('socket connecting to tcp://%s:%d', self.address[0], self.address[1])
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.connect(self.address)
+            self.sock.settimeout(1.0)
+        except socket.error as e:
+            self.log.exception('socket error while connecting: %s', str(e))
+            self.sock = None
+            raise
+
+    def disconnect(self):
+        if self.sock is not None:
+            self.sock.close()
+        self.sock = None
+
+    def recv(self, length):
+        if length <= len(self.buffer):
+            data = self.buffer[:length]
+            self.buffer = self.buffer[length:]
+            self.__log_recv(data, "from buffer")
+            return data
+        else:
+            data = self.buffer
+            self.buffer = ""
+            while len(data) < length:
+                try:
+                    if self.sock is None:
+                        self.connect()
+                    self.buffer = self.sock.recv(1024)
+                    #s = " ".join(map(lambda x: "%02X" % ord(x), list(self.buffer)))
+                    #self.log.debug("buff: %s", s)
+
+                    if len(self.buffer) == 0:
+                        # recv timed out with no additional data
+                        #self.__log_recv(data, "timeout")
+                        return data
+                    n = min(length - len(data), len(self.buffer))
+                    data = data + self.buffer[:n]
+                    self.buffer = self.buffer[n:]
+                except socket.error as e:
+                    self.disconnect()
+                    self.log.exception('socket error during reception: %s', str(e))
+                    self.__log_recv(data, "exception")
+                    return data
+            #self.__log_recv(data, "after receive")
+            return data
+
+    def send(self, data):
+        try:
+            if self.sock is None:
+                self.connect()
+            #s = " ".join(map(lambda x: "%02X" % ord(x), list(data)))
+            #self.log.debug("send: %s", s)
+            self.sock.sendall(data)
+        except socket.error as e:
+            self.disconnect()
+            self.log.exception('socket error during transmission: %s', str(e))
+            raise
+
+    def __log_recv(self, data, comment=""):
+        s = " ".join(map(lambda x: "%02X" % ord(x), list(data)))
+        if len(comment) > 0:
+            comment = " (" + comment + ")"
+        #self.log.debug("recv: %s%s", s, comment)
+
+class SerialReceiver:
+    
+    def __init__(self, port, baud):
+        self.serial = serial.Serial(port, baud, timeout=1.0)
+
+    def recv(self, length):
+        return self.serial.read(length)
+
+    def send(self, data):
+        return self.serial.write(data)
+
+
+class TracerBase:
 
     PWL_START="\xAA\x55\xAA\x55\xAA\x55" 
     COMM_SYNC="\xEB\x90\xEB\x90\xEB\x90"
     DATA_END ="\x7F"
 
-    def __init__(self, port, baud=9600, controller_id=0x16):
+    def __init__(self, io, controller_id=0x16):
         """Constructs a new Tracer object for communicating with the charge 
         controller.  port and baud specify the serial port.  The controller
         ID appears to be ignored; the documentation uses a value of 0x16 so
         that's used by default here too."""
         self.controller_id = controller_id
-        self.serial = serial.Serial(port, baud, timeout=1.0)
+        self.io = io
 
     def send(self, cmd, args=""):
         """Sends a command to the device.  args should be packed binary data,
         without the CRC."""
-        out = Tracer.PWL_START + Tracer.COMM_SYNC
+        out = TracerBase.PWL_START + TracerBase.COMM_SYNC
         data = (chr(self.controller_id) + chr(cmd.value) + chr(len(args)) 
             + args)
         out += data
         out += struct.pack(">H", crc(data))
-        out += Tracer.DATA_END
-        self.serial.write(out)
+        out += TracerBase.DATA_END
+        self.io.send(out)
 
     def read(self, expected_cmd=None):
         """Reads the response from the device.  Will raise various exceptions
@@ -38,12 +126,12 @@ class Tracer:
         it will keep reading commands until the one specified is received, or
         nothing is received for the duration of the timeout period."""
         syncpos = 0
-        while syncpos < len(Tracer.COMM_SYNC):
-            c = self.serial.read(1)
+        while syncpos < len(TracerBase.COMM_SYNC):
+            c = self.io.recv(1)
             if len(c) == 0:
                 raise TracerSyncTimeout(
                     "Did not receive synchronization response")
-            if c == Tracer.COMM_SYNC[syncpos]:
+            if c == TracerBase.COMM_SYNC[syncpos]:
                 syncpos += 1
             else:
                 syncpos = 0
@@ -51,13 +139,13 @@ class Tracer:
         cmd = self.__read_byte()
         length = self.__read_byte()
         if length > 0:
-            args = self.serial.read(length)
+            args = self.io.recv(length)
             if len(args) < length:
                 raise TracerReadTimeout(
                     "Timed out while waiting for payload data")
         else:
             args = None
-        crc_str = self.serial.read(2)
+        crc_str = self.io.recv(2)
         if len(crc_str) < 2:
             raise TracerReadTimeout("Timed out while waiting for CRC")
         (crc_val,) = struct.unpack(">H", crc_str)
@@ -84,7 +172,7 @@ class Tracer:
         return self.read(Commands.ManualControl)
     
     def __read_byte(self):
-        c = self.serial.read(1)
+        c = self.io.recv(1)
         if len(c) == 0:
             raise TracerReadTimeout("Timed out waiting for data byte")
         return ord(c)
@@ -134,6 +222,18 @@ class Tracer:
             return {
                 "load_on": load_state,
             }
+
+class NetTracer(TracerBase):
+    
+    def __init__(self, hostname, port, controller_id=0x16):
+        TracerBase.__init__(self, BufferedSocketReceiver((hostname, port)), 
+            controller_id)
+
+class Tracer(TracerBase):
+
+    def __init__(self, port, baud=9600, controller_id=0x16):
+        TracerBase.__init__(self, SerialReceiver(port, baud), 
+            controller_id)
 
 
 def crc(s):
